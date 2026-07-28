@@ -1,4 +1,4 @@
-apriltag==0.0.16
+dt-apriltags
 contourpy==1.3.2
 cycler==0.12.1
 fonttools==4.63.0
