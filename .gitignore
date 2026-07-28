@@ -1,0 +1,76 @@
+# =========================
+# Python virtual environments
+# =========================
+
+.venv/
+venv/
+env/
+*_env/
+unagi_env/
+
+# =========================
+# Python cache files
+# =========================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Python packages/builds
+# =========================
+
+*.egg-info/
+dist/
+build/
+.wheels/
+
+# =========================
+# Jupyter notebooks
+# =========================
+
+.ipynb_checkpoints/
+
+# =========================
+# IDE files
+# =========================
+
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+
+*.log
+logs/
+
+# =========================
+# ROS2 workspace files
+# =========================
+
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# =========================
+# Environment variables
+# =========================
+
+.env
+.env.*
+
+# =========================
+# Temporary files
+# =========================
+
+*.tmp
+*.swp
+*.bak

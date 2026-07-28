@@ -1,2 +1,101 @@
 Hi Ryo
 It's Me Mario!
+
+
+# Setup
+
+## 1. Clone the repository
+
+```bash
+git clone https://github.com/cansathandler/UNAGI-
+cd UNAGI-
+```
+
+---
+
+## 2. Create a virtual environment
+
+### Linux / macOS
+
+```bash
+python3 -m venv unagi_env
+```
+
+### Windows
+
+```powershell
+python -m venv unagi_env
+```
+
+---
+
+## 3. Activate the virtual environment
+
+### Linux / macOS
+
+```bash
+source unagi_env/bin/activate
+```
+
+### Windows (PowerShell)
+
+```powershell
+unagi_env\Scripts\Activate.ps1
+```
+
+### Windows (Command Prompt)
+
+```cmd
+unagi_env\Scripts\activate.bat
+```
+
+---
+
+## 4. Install the project dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 5. Verify the installation
+
+```bash
+python -c "import cv2; print(cv2.__version__)"
+```
+
+Verify that AprilTag support is available:
+
+```bash
+python -c "import cv2; print(hasattr(cv2.aruco, 'DICT_APRILTAG_36h11'))"
+```
+
+Expected output:
+
+```text
+True
+```
+
+---
+
+## 6. Generate a sample AprilTag
+
+```bash
+python generate_apriltag.py
+```
+
+This creates:
+
+```
+tags/
+└── tag_0.png
+```
+
+---
+
+## 7. Run the tracker
+
+```bash
+python apriltag_tracker.py
+```
