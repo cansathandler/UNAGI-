@@ -81,8 +81,16 @@ True
 
 ## 6. Generate a sample AprilTag
 
+### Windows (PowerShell)
+
+```powershell
+python .\src\Detection_Pipeline\Tag_Generator\april_tag_gen.py
+```
+
+### Ubuntu
+
 ```bash
-python generate_apriltag.py
+python ./src/Detection_Pipeline/Tag_Generator/april_tag_gen.py
 ```
 
 This creates:
