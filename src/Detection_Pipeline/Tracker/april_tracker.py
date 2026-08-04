@@ -107,7 +107,10 @@ def main():
         dictionary=cv2.aruco.DICT_APRILTAG_36h11,
     )
 
-    cap = cv2.VideoCapture(0)
+    #cap = cv2.VideoCapture()
+
+    # Index 1 = Iriun Webcam (iPhone)
+    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
 
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera.")
