@@ -1,1 +1,2 @@
 from april_tag_gen import generate_apriltag
+from snake_visulizer import SnakeVisualizer

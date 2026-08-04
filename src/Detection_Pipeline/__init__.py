@@ -1,2 +1,2 @@
-from Tag_Generator import all 
-from Tracker import all
+from Tag_Generator import * 
+from Tracker import *
