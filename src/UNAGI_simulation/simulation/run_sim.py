@@ -33,6 +33,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 
 import cv2
@@ -40,7 +41,8 @@ import numpy as np
 import pandas as pd
 
 from .midline_to_joints import (extract_joint_series, fit_harmonics,
-                                wave_parameters, GaitGenerator, list_clips)
+                                wave_parameters, GaitGenerator, list_clips,
+                                choose_clip)
 from .link_chain import LinkChain, JointPlant
 from .virtual_camera import TopViewCamera, TagAngleEstimator
 from .controller import PIDArray, LatencyBuffer, computed_torque_gains
@@ -48,18 +50,31 @@ from .controller import PIDArray, LatencyBuffer, computed_torque_gains
 
 def parse_links(args):
     """Robot geometry in millimetres -- caliper numbers, not assumptions."""
+    tag = ([float(v) / 1000.0 for v in args.tag_size_mm.split(",")]
+           if "," in args.tag_size_mm else float(args.tag_size_mm) / 1000.0)
+    off = ([float(v) for v in args.tag_offsets.split(",")]
+           if "," in args.tag_offsets else float(args.tag_offsets))
     if args.link_lengths_mm:
         L = [float(v) / 1000.0 for v in args.link_lengths_mm.split(",")]
-        return LinkChain(L, tag_size_m=args.tag_size)
-    return LinkChain.uniform(args.joints,
-                             head_length_m=args.head_length_mm / 1000.0,
-                             segment_length_m=args.segment_length_mm / 1000.0,
-                             tag_size_m=args.tag_size)
+        return LinkChain(L, tag_size_m=tag, tag_offsets=off)
+    return LinkChain.from_motor_spacing(
+        head_length_m=args.head_length_mm / 1000.0,
+        motor_pitch_m=args.motor_pitch_mm / 1000.0,
+        n_motors=args.joints,
+        tail_length_m=args.tail_length_mm / 1000.0,
+        tag_size_m=tag, tag_offsets=off)
 
 
 def build(args):
     chain = parse_links(args)
-    series = extract_joint_series(args.csv, args.clip, chain.fractions)
+    files = sorted(glob.glob(args.csv)) or [args.csv]
+    clip = args.clip
+    if clip is None:
+        clip, _ = choose_clip(files, chain.fractions,
+                              verbose=not args.quiet_clip,
+                              species=args.species)
+    series = extract_joint_series(files, clip, chain.fractions,
+                                  species=args.species)
     fit = fit_harmonics(series["frames"], series["theta"],
                         n_harm=args.harmonics)
     wave = wave_parameters(fit, series["link_fractions"])
@@ -80,6 +95,23 @@ def run(args):
         stall_torque=args.stall_torque, flexure_stiffness=args.flexure,
         limit_deg=args.joint_limit)
     plant.reset(gait(0.0))
+
+    # A different species may demand more than the mechanism can give.
+    # GaitGenerator clips silently at --joint-limit, so say so loudly.
+    _, th_ref = gait.as_table(2.0 / max(args.freq, 1e-3), 0.002)
+    peak = np.degrees(np.abs(th_ref).max(axis=0))
+    if (peak >= args.joint_limit - 0.5).any():
+        hit = (np.where(peak >= args.joint_limit - 0.5)[0] + 1).tolist()
+        print(f"  !! reference is being CLIPPED at {args.joint_limit} deg "
+              f"on joints {hit} -- raise --joint-limit or lower "
+              f"--amp-scale, otherwise the gait you simulate is not the "
+              f"gait you extracted")
+    tau = plant.torque_required(np.radians(peak), args.freq)
+    short = np.where(tau > plant.Kt)[0]
+    if short.size:
+        print(f"  !! joints {(short+1).tolist()} need up to "
+              f"{tau[short].max()*1000:.0f} mN.m but stall torque is "
+              f"{plant.Kt[0]*1000:.0f} mN.m at {args.freq} Hz")
     print("[plant] J [kg m^2] =", np.array2string(plant.J, precision=6))
     print("[plant] wet natural freq [Hz] =",
           np.array2string(plant.natural_frequency_hz(), precision=2))
@@ -97,17 +129,19 @@ def run(args):
                                  height=args.img_h, fx=args.fx,
                                  centre_m=(chain.total_length * 0.50, 0.0),
                                  noise_sigma=args.noise, blur_px=args.blur)
-    est = TagAngleEstimator(chain.n_links, tag_size_m=args.tag_size)
+    est = TagAngleEstimator(chain.n_links,
+                            tag_size_m=float(chain.tag_size.max()))
     print(f"[camera] {cam.metres_per_pixel()*1000:.3f} mm/px, "
-          f"tag = {cam.tag_pixels(args.tag_size):.0f} px, "
+          f"tag = {cam.tag_pixels(chain.tag_size.max()):.0f} px, "
           f"height = {cam.h:.2f} m")
-    if cam.tag_pixels(args.tag_size) < 30:
+    if cam.tag_pixels(chain.tag_size.max()) < 30:
         print("  !! tag < 30 px -- 36h11 detection will be unreliable")
     sticker, fits = chain.tag_fits_on_link()
     if not fits.all():
-        print(f"  !! sticker is {sticker*1000:.0f} mm but links "
-              f"{np.where(~fits)[0].tolist()} are shorter -- the tag will "
-              f"not physically fit")
+        bad = np.where(~fits)[0].tolist()
+        print(f"  !! sticker does not fit on links {bad} "
+              f"(need {sticker[bad[0]]*1000:.0f} mm, largest that fits: "
+              f"{chain.max_tag_size()[bad[0]]*1000:.0f} mm black tag)")
 
     dt = 1.0 / args.ctrl_hz
     cam_every = max(1, int(round(args.ctrl_hz / args.cam_hz)))
@@ -250,11 +284,26 @@ def draw_hud(img, t, ref, true, meas, seen):
 # ----------------------------------------------------------------------
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", default="Midline_Thunnus_albacares.csv")
-    p.add_argument("--clip", type=int, default=254)
+    p.add_argument("--csv", default="Midline_*.csv",
+                   help="path or glob. The published files are NOT one "
+                        "species each -- they are overlapping chunks of "
+                        "one dataset, so pass a glob and select with "
+                        "--species.")
+    p.add_argument("--species", default="Thunnus_albacares",
+                   help="species name from the CSV's species column")
+    p.add_argument("--clip", type=int, default=None,
+                   help="clip id; omitted = pick the cleanest one "
+                        "automatically (clip ids are file-specific, so "
+                        "never hard-code one across species)")
+    p.add_argument("--quiet-clip", action="store_true",
+                   help="do not print the clip ranking table")
     p.add_argument("--joints", type=int, default=10)
-    p.add_argument("--head-length-mm", type=float, default=88.0)
-    p.add_argument("--segment-length-mm", type=float, default=31.0)
+    p.add_argument("--head-length-mm", type=float, default=149.85,
+                   help="snout to the FIRST motor axis")
+    p.add_argument("--motor-pitch-mm", type=float, default=53.57,
+                   help="motor axis centre-to-centre")
+    p.add_argument("--tail-length-mm", type=float, default=50.0,
+                   help="last motor axis to the tail tip")
     p.add_argument("--link-lengths-mm", default=None,
                    help="explicit comma-separated link lengths, overrides "
                         "--joints/--head-length-mm/--segment-length-mm")
@@ -265,8 +314,14 @@ def main(argv=None):
     p.add_argument("--freq", type=float, default=1.5, help="tail beat [Hz]")
     p.add_argument("--amp-scale", type=float, default=1.0)
     p.add_argument("--joint-limit", type=float, default=45.0)
-    p.add_argument("--tag-size", type=float, default=0.018)
-    p.add_argument("--link-width-mm", type=float, default=40.0,
+    p.add_argument("--tag-size-mm", default="25",
+                   help="black tag size; scalar or one per link")
+    p.add_argument("--tag-offsets", default="0.5",
+                   help="tag position along each link, 0=front 1=rear; "
+                        "scalar or one per link. Does NOT change the "
+                        "measured joint angle, only what fits and what is "
+                        "visible.")
+    p.add_argument("--link-width-mm", type=float, default=45.0,
                    help="drawing hint only; does not affect the model")
 
     p.add_argument("--arch", default="vision", choices=["vision", "cascade"],
@@ -306,7 +361,7 @@ def main(argv=None):
     p.add_argument("--img-w", type=int, default=1920)
     p.add_argument("--img-h", type=int, default=1200)
     p.add_argument("--fx", type=float, default=1800.0)
-    p.add_argument("--fov-width", type=float, default=0.60,
+    p.add_argument("--fov-width", type=float, default=0.90,
                    help="tank width covered by the image [m]")
     p.add_argument("--noise", type=float, default=0.0)
     p.add_argument("--blur", type=int, default=0)

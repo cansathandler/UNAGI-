@@ -135,8 +135,9 @@ class TopViewCamera:
         if tag_ids is None:
             tag_ids = np.arange(len(centres))
 
-        s = chain.tag_size
+        sizes = np.atleast_1d(chain.tag_size) * np.ones(len(centres))
         for k, (c, a, tid) in enumerate(zip(centres, headings, tag_ids)):
+            s = sizes[k]
             bitmap, nm, qm = self._tag_bitmap(int(tid))
             # the bitmap includes a quiet zone -> the physical white
             # square is larger than the black tag itself

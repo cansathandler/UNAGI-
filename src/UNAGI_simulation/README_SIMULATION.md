@@ -35,8 +35,8 @@ faster, use it for parameter sweeps.
 
 | file | role |
 |---|---|
-| `midline_to_joints.py` | CSV → arc-length link fit → joint angles → shared-ω harmonic fit → `GaitGenerator` |
-| `fish_model.py` | 11-link planar kinematics, tag frames, per-joint plant (inertia, added mass, quadratic drag, TPU flexure) |
+| `midline_to_joints.py` | CSV → arc-length link fit (using **your** link lengths) → joint angles → shared-ω harmonic fit → `GaitGenerator` |
+| `link_chain.py` | plain planar link chain, tag frames, per-joint plant (inertia, added mass, quadratic drag, TPU flexure) |
 | `virtual_camera.py` | pinhole top-view renderer with real 36h11 bitmaps; `TagAngleEstimator` turns detections into joint angles |
 | `controller.py` | PID array, latency buffer, `computed_torque_gains` |
 | `run_sim.py` | closed loop, two architectures |
@@ -50,7 +50,59 @@ unchanged.
 
 ---
 
-## Results (clip 254, 10 joints, 1.5 Hz, 400 mm body)
+## No fish in the model
+
+The robot model is a plain serial chain. There is no hull, no taper, no
+morphology. Every plant coefficient comes from something you can measure:
+
+| CLI flag | what it is | how you get it |
+|---|---|---|
+| `--head-length-mm` | snout → first motor axis | drawing |
+| `--motor-pitch-mm` | motor axis centre-to-centre | drawing |
+| `--tail-length-mm` | last motor axis → tail tip | drawing |
+| `--link-lengths-mm "150,53.6,..."` | fully explicit override | drawing |
+| `--tag-size-mm` | black tag square; scalar or one per link | your printer |
+| `--tag-offsets` | tag position along each link, 0=front 1=rear | your call |
+| `--segment-mass` | mass of one printed segment [kg] | scale |
+| `--segment-width-mm` | lateral projected width, sets drag area | caliper |
+| `--stall-torque` | N·m per unit duty | motor datasheet, then bench |
+| `--flexure` | TPU return spring [N·m/rad] | hang a mass at a known lever arm |
+| `--tag-size` | printed black square | your printer |
+| `--link-width-mm` | **drawing hint only**, no effect on the model | — |
+
+The biology enters in exactly one place: the joint-angle *reference*
+produced by `midline_to_joints.py`. The midline is resampled onto **your**
+link lengths, so the fit follows the robot's geometry rather than an
+assumed fish morphology.
+
+`chain.tag_fits_on_link()` checks the sticker against the link length.
+With a 2-module quiet zone the 36h11 sticker is 1.5× the nominal tag, so an
+18 mm tag needs a 27 mm link. The simulator warns if it does not fit.
+
+`plant.torque_required(amplitude, freq)` gives the peak torque per joint —
+compare against `Kt` before ordering motors.
+
+## Tag placement
+
+The tag position along a link **does not affect the measured joint angle**.
+The angle comes from tag *orientation*, and every point of a rigid link
+shares that orientation. Slide the tags to wherever there is flat, dry,
+unoccluded surface.
+
+What does matter:
+
+- the tag's x axis must be parallel to the link axis — a constant
+  misalignment becomes a constant offset on that joint and must be
+  calibrated out (straighten the robot, record, subtract);
+- the printed sticker must fit *between* the two joints, not wrap over a
+  hinge — `chain.tag_fits_on_link()` checks this;
+- bigger is strictly better. `chain.max_tag_size()` gives the largest tag
+  each link can carry.
+
+`chain.tag_positions_mm()` prints the tag centres from the snout, ready for
+the CAD.
+
+## Results (clip 254, 10 motors, 149.85 + 9×53.57 + 50 mm = 682 mm, 1.5 Hz)
 
 **Gait extracted from biology**
 
@@ -93,25 +145,95 @@ Circular low-pass across phase bins (`--ilc-qwin 5`) plus a leak
 (`--ilc-leak 0.97`) holds 1.9–2.0° indefinitely. See
 `fig6_ilc_convergence.png`.
 
-**Camera sizing** (18 mm tag, 1920×1200)
+**Camera sizing** (25 mm tag, 1920×1200, 682 mm robot)
 
 | FOV width | tag [px] | mean angle error |
 |---|---|---|
-| 0.45 m | 77 | 0.21° |
-| 0.60 m | 58 | 0.32° |
-| 0.80 m | 43 | 0.45° |
-| 1.05 m | 33 | 0.87° |
-| 1.40 m | 25 | 1.05° |
+| 0.72 m | 67 | 0.24° |
+| 0.80 m | 60 | 0.33° |
+| 0.90 m | 53 | 0.33° |
+| 1.05 m | 46 | 0.40° |
+| 1.30 m | 37 | 0.76° |
+| 1.60 m | 30 | 1.02° |
 
-Anterior joints move ~2°, so beyond ~1 m FOV the measurement noise exceeds
-the signal there. Either stay under 0.6 m, or accept that the front of the
-body is encoder-only.
+The robot is 682 mm long, so the FOV cannot go below ~0.75 m — the
+undulating body plus margin has to fit. That fixes the scale at roughly
+0.4 mm/px and makes tag size the only remaining lever.
 
-Geometric constraint: at 400 mm body length with a 22% head, each segment is
-**31 mm**, and an 18 mm tag plus quiet zone is **25 mm** square. Ten tags is
-geometrically tight — consider tagging alternate segments and interpolating.
+Anterior joints move only ~2°, so keep the FOV at or under ~0.9 m and use
+the largest tag the link allows. `max_tag_size()` gives 33 mm on the
+53.57 mm segments, 31 mm on the tail, 97 mm on the head.
 
 ---
+
+## Using a different species
+
+**The published files are not one species each.** Despite the names,
+`Midline_Anguilla_rostrata.csv` contains 44 species, and the six files are
+overlapping alphabetical chunks of one dataset. Selecting by *filename*
+silently gives you the wrong fish — e.g. picking the "Anguilla",
+"Salvelinus" and "Scomber" files returns the identical clip 156 three
+times. Select with `--species`, always.
+
+```bash
+python -m simulation.compare_species --list-species
+python -m simulation.make_report  --csv "Midline_*.csv" --species Scomber_scombrus
+python -m simulation.run_sim      --csv "Midline_*.csv" --species Anguilla_rostrata --arch cascade
+```
+
+The glob is read as one de-duplicated dataset. Name spellings are
+normalised, since the dataset uses both `Thunnus albacares` and
+`Thunnus_albacares`.
+
+Four things used to be hard-coded and are now handled:
+
+- **Species.** Filtered on the `species` column, not the filename.
+
+- **Clip id.** `choose_clip()` scores every clip by how well one shared-
+  frequency sinusoid explains its four largest-amplitude joints, and picks
+  the winner. The ranking is written to `outputs/clip_selection.csv`.
+  Anterior joints are excluded from the score on purpose: on a thunniform
+  swimmer they move 1–2°, so including them would rank clips by how still
+  the head was.
+- **Period search range.** Derived from each clip's own frame span, so a
+  different camera frame rate needs no tuning. Override `period_range` if a
+  clip covers more than ~4 tail beats.
+- **Plot scaling.** The reference colour scale follows the data.
+
+Two warnings now fire when the gait exceeds the mechanism:
+
+```
+!! reference is being CLIPPED at 45.0 deg on joints [10]
+!! joints [1, 5, 6, 7, 9] need up to 190 mN.m but stall torque is 45 mN.m at 3.0 Hz
+```
+
+The first matters most. `GaitGenerator` clips at `--joint-limit` silently,
+so without the warning you would be simulating a gait you did not extract.
+
+## Six swimming modes on the same robot
+
+`python -m simulation.compare_species` runs the extraction across species
+and asks whether this mechanism can reproduce each gait. At 1.5 Hz, with
+45 mN·m stall torque:
+
+| species | λ [BL] | head→tail lag | peak joint | peak torque | motor-limited joints |
+|---|---|---|---|---|---|
+| *Anguilla rostrata* (eel) | 0.55 | 474° | 30.5° | 68 mN·m | **7** |
+| *Acipenser brevirostrum* (sturgeon) | 0.83 | 319° | 35.6° | 29 mN·m | 0 |
+| *Salvelinus fontinalis* (brook trout) | 0.80 | 328° | 25.1° | 19 mN·m | 0 |
+| *Scomber scombrus* (mackerel) | 0.90 | 285° | 21.9° | 15 mN·m | 0 |
+| *Lutjanus griseus* (snapper) | 1.19 | 234° | 22.7° | 18 mN·m | 0 |
+| *Thunnus albacares* (tuna) | 1.33 | 173° | 23.0° | 11 mN·m | 0 |
+
+The wavelength ordering matches the textbook anguilliform → thunniform
+continuum, which is a good sign the extraction is doing what it claims.
+
+The eel is the outlier and the interesting case: it needs 16° of anterior
+amplitude where the tuna needs 1°, and the anterior joints carry the most
+inertia, so seven of ten joints exceed stall torque. **UNAGI as currently
+specified cannot swim like an eel at 1.5 Hz.** Either drop to ~1 Hz, scale
+the amplitude, or fit stronger motors forward. Everything else fits with
+margin.
 
 ## Exports for firmware
 

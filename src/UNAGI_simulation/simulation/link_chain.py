@@ -38,7 +38,7 @@ class LinkChain:
         joint k = motor between link k-1 and link k,  k = 1..N
     """
 
-    def __init__(self, link_lengths_m, tag_size_m=0.018):
+    def __init__(self, link_lengths_m, tag_size_m=0.018, tag_offsets=0.5):
         self.L = np.asarray(link_lengths_m, dtype=float)
         if self.L.ndim != 1 or self.L.size < 2:
             raise ValueError("link_lengths_m must be a 1-D list of >= 2 links")
@@ -46,7 +46,42 @@ class LinkChain:
         self.n_joints = self.n_links - 1
         self.total_length = float(self.L.sum())
         self.fractions = self.L / self.total_length     # for the midline fit
-        self.tag_size = float(tag_size_m)
+
+        # tag size: scalar, or one per link (a long head can carry a
+        # bigger tag than a short segment, and bigger is strictly better
+        # for angular resolution)
+        self.tag_size = np.asarray(tag_size_m, float) * np.ones(self.n_links)
+
+        # where along its link each tag sits, as a fraction from the
+        # proximal node.  0.5 = midpoint.
+        #
+        # NOTE: this does NOT affect the measured joint angle.  The joint
+        # angle comes from tag ORIENTATION, and every point of a rigid
+        # link shares the link's orientation.  So you are free to slide
+        # the tag anywhere there is flat, dry, unoccluded surface.  What
+        # DOES matter is that the tag's x axis is parallel to the link
+        # axis -- any constant misalignment shows up as a constant offset
+        # in that joint and must be calibrated out (see zero_offsets()).
+        self.tag_offsets = np.asarray(tag_offsets, float) * np.ones(
+            self.n_links)
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_motor_spacing(cls, head_length_m, motor_pitch_m, n_motors,
+                           tail_length_m, **kw):
+        """The way the robot is actually dimensioned on the drawing.
+
+        head_length_m : snout to the FIRST motor axis
+        motor_pitch_m : centre-to-centre distance between motor axes
+        n_motors      : number of joints
+        tail_length_m : last motor axis to the tail tip
+
+        Produces n_motors+1 links: head, (n_motors-1) inter-motor links,
+        and the tail.
+        """
+        L = ([head_length_m] + [motor_pitch_m] * (n_motors - 1)
+             + [tail_length_m])
+        return cls(L, **kw)
 
     # ------------------------------------------------------------------
     @classmethod
@@ -57,9 +92,11 @@ class LinkChain:
                    tag_size_m=tag_size_m)
 
     def __repr__(self):
+        ts = self.tag_size * 1000
+        tag = (f"{ts[0]:.0f} mm" if np.allclose(ts, ts[0])
+               else f"{ts.min():.0f}-{ts.max():.0f} mm")
         return (f"LinkChain({self.n_links} links, {self.n_joints} joints, "
-                f"total {self.total_length*1000:.0f} mm, "
-                f"tag {self.tag_size*1000:.0f} mm)")
+                f"total {self.total_length*1000:.1f} mm, tag {tag})")
 
     # ------------------------------------------------------------------
     def forward(self, theta, base_pos=(0.0, 0.0), base_heading=0.0):
@@ -78,28 +115,51 @@ class LinkChain:
         return nodes, phi
 
     def tag_poses(self, nodes, phi):
-        """Centre and heading of the tag glued to the top of each link.
+        """Centre and heading of the tag on each link.
 
-        The tag sits at the link midpoint and shares the link's heading,
-        so a detected tag orientation IS the link orientation, and the
-        difference between two neighbours IS the joint angle.
+        The tag shares its link's heading, so a detected tag orientation
+        IS the link orientation and the difference between two neighbours
+        IS the joint angle -- regardless of where along the link the tag
+        is glued.
         """
-        centres = 0.5 * (nodes[:-1] + nodes[1:])
+        d = nodes[1:] - nodes[:-1]
+        centres = nodes[:-1] + d * self.tag_offsets[:, None]
         return centres, phi
+
+    def tag_positions_mm(self):
+        """Distance from the snout to each tag centre [mm], for the CAD."""
+        node_s = np.concatenate([[0.0], np.cumsum(self.L)])
+        return (node_s[:-1] + self.L * self.tag_offsets) * 1000.0
 
     def joint_arclength(self):
         """Distance from the snout to each joint [m] (for plotting)."""
         return np.cumsum(self.L)[:-1]
 
     def tag_fits_on_link(self, quiet_modules=2):
-        """The printed white square is larger than the black tag.
+        """Check the printed sticker against the available link length.
 
-        36h11 is 8 modules across, so with a 2-module quiet zone on each
-        side the sticker is 12/8 = 1.5x the nominal tag size.  Returns the
-        required sticker size and a per-link boolean.
+        36h11 is 8 modules across, so a 2-module quiet zone on each side
+        makes the sticker 12/8 = 1.5x the nominal black tag.  The sticker
+        must also fit BETWEEN the two joints given where it is centred,
+        otherwise it wraps over a hinge and stops being planar.
         """
         sticker = self.tag_size * (8 + 2 * quiet_modules) / 8.0
-        return sticker, self.L >= sticker
+        half = sticker / 2.0
+        start = self.L * self.tag_offsets - half
+        end = self.L * self.tag_offsets + half
+        fits = (start >= 0.0) & (end <= self.L)
+        return sticker, fits
+
+    def max_tag_size(self, quiet_modules=2, margin_m=0.002):
+        """Largest black tag that still fits on each link, centred.
+
+        Bigger tags are strictly better: angular resolution scales with
+        tag size in pixels.  Use this before choosing --tag-size.
+        """
+        avail = 2 * np.minimum(self.L * self.tag_offsets,
+                               self.L * (1 - self.tag_offsets))
+        return np.maximum(avail - 2 * margin_m, 0.0) * 8.0 / (
+            8 + 2 * quiet_modules)
 
 
 # ----------------------------------------------------------------------
