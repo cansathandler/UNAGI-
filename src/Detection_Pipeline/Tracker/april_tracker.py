@@ -108,9 +108,9 @@ def main():
     )
 
     #cap = cv2.VideoCapture()
-
+    cap = cv2.VideoCapture(2)
     # Index 1 = Iriun Webcam (iPhone)
-    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+    #cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
 
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera.")
