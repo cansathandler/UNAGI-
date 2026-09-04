@@ -31,7 +31,7 @@ import pandas as pd
 
 from .midline_to_joints import (extract_joint_series, fit_harmonics,
                                 wave_parameters, GaitGenerator)
-from .fish_model import FishKinematics, JointPlant
+from .link_chain import LinkChain, JointPlant
 from .virtual_camera import TopViewCamera, TagAngleEstimator
 from .run_sim import main as run_main
 
@@ -39,8 +39,10 @@ OUT = "outputs"
 CSV = "Midline_Thunnus_albacares.csv"
 CLIP = 254
 NJ = 10
-BL = 0.40
 TAG = 0.018
+HEAD_MM = 88.0
+SEG_MM = 31.0
+LINK_W = 0.040        # drawing hint only
 
 plt.rcParams.update({"figure.dpi": 130, "font.size": 9,
                      "axes.grid": True, "grid.alpha": 0.25,
@@ -55,7 +57,7 @@ def quiet(fn, *a, **kw):
 
 
 # ----------------------------------------------------------------------
-def fig1_midline(series, kin):
+def fig1_midline(series, chain):
     ml = series["midlines"]
     nodes = series["nodes"]
     M = len(ml)
@@ -70,7 +72,7 @@ def fig1_midline(series, kin):
     ax[0].set_title(f"Thunnus albacares midlines, clip {series['clip_id']} "
                     f"({M} snapshots, one tail beat)")
     ax[0].set_ylabel("lateral [BL]")
-    ax[1].set_title(f"Inextensible {kin.n_links}-link chain fitted by arc "
+    ax[1].set_title(f"Inextensible {chain.n_links}-link chain fitted by arc "
                     f"length (dots = joints / AprilTags)")
     ax[1].set_ylabel("lateral [BL]")
     ax[1].set_xlabel("along body [BL]")
@@ -81,7 +83,7 @@ def fig1_midline(series, kin):
     plt.close(fig)
 
 
-def fig2_gait(series, fit, wave, kin):
+def fig2_gait(series, fit, wave, chain):
     s = wave["joint_s"]
     fig, ax = plt.subplots(1, 3, figsize=(10.5, 3.2))
 
@@ -154,7 +156,7 @@ def fig4_latency(lat_ms, res):
     plt.close(fig)
 
 
-def fig5_tag_resolution(series, kin):
+def fig5_tag_resolution(series, chain):
     """How big must a tag be, in pixels, to measure a 2 deg joint angle?"""
     fit = fit_harmonics(series["frames"], series["theta"], 1)
     gait = GaitGenerator(series, fit, freq_hz=1.5)
@@ -162,15 +164,15 @@ def fig5_tag_resolution(series, kin):
     px, err, miss = [], [], []
     for fov in fovs:
         cam = TopViewCamera.from_fov(fov, 1920, 1200, fx=1800,
-                                     centre_m=(BL * 0.5, 0.0))
-        est = TagAngleEstimator(kin.n_links, TAG)
+                                     centre_m=(chain.total_length * 0.5, 0.0))
+        est = TagAngleEstimator(chain.n_links, TAG)
         e, m = [], 0
         for t in np.linspace(0, 0.66, 12):
             th = gait(t)
-            nodes, phi = kin.forward(th)
-            img = cam.render(kin, nodes, phi)
+            nodes, phi = chain.forward(th)
+            img = cam.render(chain, nodes, phi, link_width_m=LINK_W)
             tm, pm, c, seen = est(img)
-            m += (kin.n_links - seen.sum())
+            m += (chain.n_links - seen.sum())
             if seen.all():
                 e.append(np.degrees(np.abs(tm - th)))
         px.append(cam.tag_pixels(TAG))
@@ -225,7 +227,7 @@ def fig6_ilc():
     plt.close(fig)
 
 
-def export_tables(series, fit, wave, kin):
+def export_tables(series, fit, wave, chain):
     pd.DataFrame({
         "joint": np.arange(1, NJ + 1),
         "s_BL": wave["joint_s"],
@@ -257,22 +259,22 @@ def export_tables(series, fit, wave, kin):
         f.write("};\n")
 
 
-def make_video(series, fit, kin, seconds=3.0, fps=60):
+def make_video(series, fit, chain, seconds=3.0, fps=60):
     gait = GaitGenerator(series, fit, freq_hz=1.5)
     cam = TopViewCamera.from_fov(0.60, 1920, 1200, fx=1800,
-                                 centre_m=(BL * 0.5, 0.0))
-    est = TagAngleEstimator(kin.n_links, TAG)
+                                 centre_m=(chain.total_length * 0.5, 0.0))
+    est = TagAngleEstimator(chain.n_links, TAG)
     path = f"{OUT}/unagi_topview.mp4"
     vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps,
                          (1920, 1200))
     for i in range(int(seconds * fps)):
         t = i / fps
         th = gait(t)
-        nodes, phi = kin.forward(th)
-        img = cam.render(kin, nodes, phi)
+        nodes, phi = chain.forward(th)
+        img = cam.render(chain, nodes, phi, link_width_m=LINK_W)
         tm, pm, c, seen = est(img)
         cv2.putText(img, f"t={t:5.2f}s   tags {int(seen.sum())}/"
-                         f"{kin.n_links}   max angle err "
+                         f"{chain.n_links}   max angle err "
                          f"{np.degrees(np.abs(tm-th)).max():.2f} deg",
                     (20, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                     (20, 20, 20), 2, cv2.LINE_AA)
@@ -289,10 +291,15 @@ def make_video(series, fit, kin, seconds=3.0, fps=60):
 # ----------------------------------------------------------------------
 def run():
     os.makedirs(OUT, exist_ok=True)
-    series = extract_joint_series(CSV, CLIP, NJ, 0.22)
+    chain = LinkChain.uniform(NJ, HEAD_MM / 1000.0, SEG_MM / 1000.0, TAG)
+    series = extract_joint_series(CSV, CLIP, chain.fractions)
     fit = fit_harmonics(series["frames"], series["theta"], 1)
     wave = wave_parameters(fit, series["link_fractions"])
-    kin = FishKinematics(series["link_fractions"], BL, TAG)
+    print(chain)
+    sticker, fits = chain.tag_fits_on_link()
+    print(f"tag sticker {sticker*1000:.0f} mm vs shortest link "
+          f"{chain.L.min()*1000:.0f} mm -> "
+          f"{'fits' if fits.all() else 'DOES NOT FIT'}")
 
     print("== gait extracted from biology ==")
     print(f"clip {series['clip_id']}, {len(series['frames'])} snapshots, "
@@ -300,9 +307,9 @@ def run():
     print(f"body wavelength {wave['wavelength_BL']:.2f} BL, "
           f"head->tail phase lag {wave['total_lag_deg']:.0f} deg")
 
-    fig1_midline(series, kin)
-    fig2_gait(series, fit, wave, kin)
-    export_tables(series, fit, wave, kin)
+    fig1_midline(series, chain)
+    fig2_gait(series, fit, wave, chain)
+    export_tables(series, fit, wave, chain)
 
     # --- closed loop, real rendering + real AprilTag detection --------
     base = ("--csv " + CSV + f" --clip {CLIP} --duration 4 --freq 1.5 "
@@ -334,10 +341,10 @@ def run():
         f"{OUT}/latency_study.csv", index=False)
 
     fig6_ilc()
-    px, err = fig5_tag_resolution(series, kin)
+    px, err = fig5_tag_resolution(series, chain)
     print("tag px:", np.round(px, 1), " angle err deg:", np.round(err, 2))
 
-    vid = make_video(series, fit, kin)
+    vid = make_video(series, fit, chain)
     print("video:", vid)
 
 

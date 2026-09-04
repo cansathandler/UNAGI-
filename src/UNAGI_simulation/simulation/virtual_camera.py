@@ -100,33 +100,42 @@ class TopViewCamera:
         return self._tag_cache[key]
 
     # ------------------------------------------------------------------
-    def render(self, kin, nodes, phi, tag_ids=None, draw_axes=True,
-               background=245):
-        """Return a BGR uint8 image of the robot seen from above."""
+    def render(self, chain, nodes, phi, tag_ids=None, background=245,
+               link_width_m=None):
+        """Return a BGR uint8 image of the chain seen from above.
+
+        link_width_m : optional.  Draws each link as a plain rectangle of
+                       this width, purely so the video is readable.  It is
+                       a drawing hint, not part of the model, and it has no
+                       effect on detection.  None = spine only.
+        """
         img = np.full((self.H, self.W, 3), background, np.uint8)
 
-        # subtle water texture so the detector is not fed a perfect page
-        if self.noise_sigma > 0:
-            img = cv2.add(img, np.zeros_like(img))
+        # ---- links ----------------------------------------------------
+        if link_width_m:
+            hw = link_width_m / 2.0
+            for k in range(chain.n_links):
+                a, b = nodes[k], nodes[k + 1]
+                nx, ny = -np.sin(phi[k]), np.cos(phi[k])
+                off = np.array([nx, ny]) * hw
+                quad = np.array([a + off, b + off, b - off, a - off])
+                poly = self.project(quad).astype(np.int32)
+                cv2.fillPoly(img, [poly], (176, 176, 176))
+                cv2.polylines(img, [poly], True, (110, 110, 110), 1,
+                              cv2.LINE_AA)
 
-        # ---- hull -----------------------------------------------------
-        outline = kin.body_outline(nodes, phi)
-        poly = self.project(outline).astype(np.int32)
-        cv2.fillPoly(img, [poly], (150, 150, 150))
-        cv2.polylines(img, [poly], True, (90, 90, 90), 2, cv2.LINE_AA)
-
-        # ---- spine ----------------------------------------------------
+        # ---- spine and joints -----------------------------------------
         spine = self.project(nodes).astype(np.int32)
         cv2.polylines(img, [spine], False, (70, 70, 70), 1, cv2.LINE_AA)
-        for p in spine:
-            cv2.circle(img, tuple(p), 3, (40, 40, 40), -1, cv2.LINE_AA)
+        for p in spine[1:-1]:
+            cv2.circle(img, tuple(p), 4, (40, 40, 40), -1, cv2.LINE_AA)
 
         # ---- tags -----------------------------------------------------
-        centres, headings = kin.tag_poses(nodes, phi)
+        centres, headings = chain.tag_poses(nodes, phi)
         if tag_ids is None:
             tag_ids = np.arange(len(centres))
 
-        s = kin.tag_size
+        s = chain.tag_size
         for k, (c, a, tid) in enumerate(zip(centres, headings, tag_ids)):
             bitmap, nm, qm = self._tag_bitmap(int(tid))
             # the bitmap includes a quiet zone -> the physical white

@@ -41,34 +41,44 @@ import pandas as pd
 
 from .midline_to_joints import (extract_joint_series, fit_harmonics,
                                 wave_parameters, GaitGenerator, list_clips)
-from .fish_model import FishKinematics, JointPlant
+from .link_chain import LinkChain, JointPlant
 from .virtual_camera import TopViewCamera, TagAngleEstimator
 from .controller import PIDArray, LatencyBuffer, computed_torque_gains
 
 
+def parse_links(args):
+    """Robot geometry in millimetres -- caliper numbers, not assumptions."""
+    if args.link_lengths_mm:
+        L = [float(v) / 1000.0 for v in args.link_lengths_mm.split(",")]
+        return LinkChain(L, tag_size_m=args.tag_size)
+    return LinkChain.uniform(args.joints,
+                             head_length_m=args.head_length_mm / 1000.0,
+                             segment_length_m=args.segment_length_mm / 1000.0,
+                             tag_size_m=args.tag_size)
+
+
 def build(args):
-    series = extract_joint_series(args.csv, args.clip, args.joints,
-                                  args.head_fraction)
+    chain = parse_links(args)
+    series = extract_joint_series(args.csv, args.clip, chain.fractions)
     fit = fit_harmonics(series["frames"], series["theta"],
                         n_harm=args.harmonics)
     wave = wave_parameters(fit, series["link_fractions"])
     gait = GaitGenerator(series, fit, freq_hz=args.freq,
                          amp_scale=args.amp_scale, mode=args.gait_mode,
                          clip_deg=args.joint_limit)
-    kin = FishKinematics(series["link_fractions"],
-                         body_length_m=args.body_length,
-                         tag_size_m=args.tag_size)
-    return series, fit, wave, gait, kin
+    return series, fit, wave, gait, chain
 
 
 def run(args):
-    series, fit, wave, gait, kin = build(args)
+    series, fit, wave, gait, chain = build(args)
     os.makedirs(args.out, exist_ok=True)
 
-    n_j = kin.n_joints
-    plant = JointPlant.from_kinematics(
-        kin, body_mass_kg=args.body_mass, stall_torque=args.stall_torque,
-        flexure_stiffness=args.flexure, limit_deg=args.joint_limit)
+    n_j = chain.n_joints
+    plant = JointPlant.from_chain(
+        chain, segment_mass_kg=args.segment_mass,
+        segment_width_m=args.segment_width_mm / 1000.0,
+        stall_torque=args.stall_torque, flexure_stiffness=args.flexure,
+        limit_deg=args.joint_limit)
     plant.reset(gait(0.0))
     print("[plant] J [kg m^2] =", np.array2string(plant.J, precision=6))
     print("[plant] wet natural freq [Hz] =",
@@ -85,14 +95,19 @@ def run(args):
 
     cam = TopViewCamera.from_fov(args.fov_width, width=args.img_w,
                                  height=args.img_h, fx=args.fx,
-                                 centre_m=(args.body_length * 0.50, 0.0),
+                                 centre_m=(chain.total_length * 0.50, 0.0),
                                  noise_sigma=args.noise, blur_px=args.blur)
-    est = TagAngleEstimator(kin.n_links, tag_size_m=args.tag_size)
+    est = TagAngleEstimator(chain.n_links, tag_size_m=args.tag_size)
     print(f"[camera] {cam.metres_per_pixel()*1000:.3f} mm/px, "
           f"tag = {cam.tag_pixels(args.tag_size):.0f} px, "
           f"height = {cam.h:.2f} m")
     if cam.tag_pixels(args.tag_size) < 30:
         print("  !! tag < 30 px -- 36h11 detection will be unreliable")
+    sticker, fits = chain.tag_fits_on_link()
+    if not fits.all():
+        print(f"  !! sticker is {sticker*1000:.0f} mm but links "
+              f"{np.where(~fits)[0].tolist()} are shorter -- the tag will "
+              f"not physically fit")
 
     dt = 1.0 / args.ctrl_hz
     cam_every = max(1, int(round(args.ctrl_hz / args.cam_hz)))
@@ -144,8 +159,9 @@ def run(args):
                 theta_meas_raw = plant.theta + np.random.normal(
                     0.0, np.radians(args.meas_noise_deg), n_j)
             else:
-                nodes, phi = kin.forward(plant.theta)
-                img = cam.render(kin, nodes, phi)
+                nodes, phi = chain.forward(plant.theta)
+                img = cam.render(chain, nodes, phi,
+                                 link_width_m=args.link_width_mm / 1000.0)
                 th_m, phi_m, centres, seen = est(img)
                 theta_meas_raw = th_m
                 if writer is not None:
@@ -218,7 +234,7 @@ def run(args):
     df = pd.DataFrame(log, columns=cols)
     df.to_csv(os.path.join(args.out, "sim_log.csv"), index=False)
 
-    return series, fit, wave, gait, kin, df, frames_out
+    return series, fit, wave, gait, chain, df, frames_out
 
 
 def draw_hud(img, t, ref, true, meas, seen):
@@ -237,7 +253,11 @@ def main(argv=None):
     p.add_argument("--csv", default="Midline_Thunnus_albacares.csv")
     p.add_argument("--clip", type=int, default=254)
     p.add_argument("--joints", type=int, default=10)
-    p.add_argument("--head-fraction", type=float, default=0.22)
+    p.add_argument("--head-length-mm", type=float, default=88.0)
+    p.add_argument("--segment-length-mm", type=float, default=31.0)
+    p.add_argument("--link-lengths-mm", default=None,
+                   help="explicit comma-separated link lengths, overrides "
+                        "--joints/--head-length-mm/--segment-length-mm")
     p.add_argument("--harmonics", type=int, default=1)
     p.add_argument("--gait-mode", default="harmonic",
                    choices=["harmonic", "spline"])
@@ -245,8 +265,9 @@ def main(argv=None):
     p.add_argument("--freq", type=float, default=1.5, help="tail beat [Hz]")
     p.add_argument("--amp-scale", type=float, default=1.0)
     p.add_argument("--joint-limit", type=float, default=45.0)
-    p.add_argument("--body-length", type=float, default=0.40)
     p.add_argument("--tag-size", type=float, default=0.018)
+    p.add_argument("--link-width-mm", type=float, default=40.0,
+                   help="drawing hint only; does not affect the model")
 
     p.add_argument("--arch", default="vision", choices=["vision", "cascade"],
                    help="vision = PID directly on the camera measurement; "
@@ -264,7 +285,10 @@ def main(argv=None):
                    help="closed-loop bandwidth [Hz]; 0 = use raw kp/ki/kd")
     p.add_argument("--zeta", type=float, default=0.9)
 
-    p.add_argument("--body-mass", type=float, default=0.55)
+    p.add_argument("--segment-mass", type=float, default=0.045,
+                   help="mass of one printed segment [kg]")
+    p.add_argument("--segment-width-mm", type=float, default=40.0,
+                   help="lateral projected width, sets the drag area")
     p.add_argument("--stall-torque", type=float, default=0.045)
     p.add_argument("--flexure", type=float, default=0.030)
 
@@ -299,19 +323,19 @@ def main(argv=None):
     p.add_argument("--save-every", type=int, default=10)
     args = p.parse_args(argv)
 
-    series, fit, wave, gait, kin, df, frames = run(args)
+    series, fit, wave, gait, chain, df, frames = run(args)
 
     print(f"clip {series['clip_id']}  snapshots={len(series['frames'])}")
     print(f"tail-beat period  = {fit['period_frames']:.1f} video frames")
     print(f"body wavelength   = {wave['wavelength_BL']:.2f} BL")
     print(f"head->tail lag    = {wave['total_lag_deg']:.0f} deg")
     print("joint | amp[deg] | phase[deg] | R^2")
-    for k in range(kin.n_joints):
+    for k in range(chain.n_joints):
         print(f"  {k+1:2d}  |  {np.degrees(fit['amp'][k,0]):6.2f}  |"
               f"  {np.degrees(fit['phase'][k,0]):7.1f}   | {fit['r2'][k]:.3f}")
     e = df[[c for c in df.columns if c.startswith("err_")]].to_numpy()
     print(f"tracking RMS error = {np.degrees(np.sqrt((e**2).mean())):.2f} deg")
-    return series, fit, wave, gait, kin, df
+    return series, fit, wave, gait, chain, df
 
 
 if __name__ == "__main__":

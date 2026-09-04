@@ -87,12 +87,6 @@ def list_clips(csv_path: str) -> pd.DataFrame:
 # ----------------------------------------------------------------------
 # 2. Midline -> serial chain
 # ----------------------------------------------------------------------
-def default_link_fractions(n_joints: int = 10, head_fraction: float = 0.22):
-    """Head link is longer (it holds the electronics); rest is uniform."""
-    body = (1.0 - head_fraction) / n_joints
-    return np.array([head_fraction] + [body] * n_joints)
-
-
 def resample_chain(midline: np.ndarray, link_fractions: np.ndarray):
     """Fit an inextensible serial chain to one midline snapshot.
 
@@ -127,14 +121,21 @@ def nodes_to_angles(nodes: np.ndarray):
     return phi, theta
 
 
-def extract_joint_series(csv_path, clip_id=None, n_joints=10,
-                         head_fraction=0.22):
+def extract_joint_series(csv_path, clip_id=None, link_fractions=None):
     """Full pipeline: CSV -> theta(frame) for every joint.
 
-    Returns dict with frames (M,), theta (M, n_joints), nodes (M, n_joints+2, 2)
+    link_fractions : link lengths as fractions of the total, summing to 1.
+                     Pass `chain.fractions` from your LinkChain -- the fit
+                     follows the ROBOT's geometry, not an assumed fish
+                     morphology.
+
+    Returns dict with frames (M,), theta (M, n_joints), nodes (M, n_links+1, 2)
     """
     frames, midlines, clip_id = load_clip(csv_path, clip_id)
-    fr = default_link_fractions(n_joints, head_fraction)
+    if link_fractions is None:
+        raise ValueError("link_fractions is required; pass chain.fractions")
+    fr = np.asarray(link_fractions, dtype=float)
+    fr = fr / fr.sum()
 
     nodes_all, theta_all, phi_all = [], [], []
     for ml in midlines:
