@@ -177,7 +177,11 @@ def run(args):
 
     writer = None
     if args.video:
-        path = os.path.join(args.out, "unagi_topview.mp4")
+        # name the file after what is in it, so a loop over species does
+        # not overwrite itself
+        tag = f"{args.species}_{args.arch}_clip{series['clip_id']}"
+        path = os.path.join(args.out, f"unagi_{tag}.mp4")
+        print(f"[video] {path}")
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
                                  args.cam_hz, (args.img_w, args.img_h))
 

@@ -38,7 +38,7 @@ from .run_sim import main as run_main
 
 OUT = "outputs"
 CSV = "Midline_*.csv"    # glob: the files overlap, they are read as one
-SPECIES = "Anguilla_rostrata"
+SPECIES = "Thunnus_albacares"
 CLIP = None              # None = pick the cleanest clip automatically
 NJ = 10
 TAG = 0.025           # black square; 33 mm is the largest that fits

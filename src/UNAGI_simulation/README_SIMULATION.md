@@ -210,6 +210,24 @@ Two warnings now fire when the gait exceeds the mechanism:
 The first matters most. `GaitGenerator` clips at `--joint-limit` silently,
 so without the warning you would be simulating a gait you did not extract.
 
+## Rendering every species
+
+One `run_sim` call = one species = one video. `--species` defaults to
+`Thunnus_albacares`, so the plain command renders the tuna only. The video
+filename now carries the species and clip, so a loop does not overwrite
+itself:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\make_all_videos.ps1   # Windows
+```
+```bash
+bash make_all_videos.sh                                           # Linux/mac
+```
+
+Each render is ~360 frames at 1920x1200, so budget a few minutes per
+species. Drop `--video` for the tracking numbers alone — that takes
+seconds.
+
 ## Six swimming modes on the same robot
 
 `python -m simulation.compare_species` runs the extraction across species
