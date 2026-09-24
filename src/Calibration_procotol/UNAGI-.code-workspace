@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "Calibration_procotol",
+			"path": "../../Calibration_procotol"
+		}
+	],
+	"settings": {}
+}
