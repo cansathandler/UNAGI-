@@ -15,7 +15,7 @@ unagi_test.py — .md の受入試験を実行する PC 側スクリプト
 import argparse, socket, time, csv, sys, statistics
 from pathlib import Path
 
-HOST, PORT = "192.168.4.1", 5000
+HOST, PORT = "192.168.4.1", 5555   # ヘッド v31: SSID "UNAGI-HEAD", port 5555
 N_NODES = 10
 OUT = Path("data"); OUT.mkdir(exist_ok=True)
 
@@ -25,6 +25,14 @@ class Head:
         self.s = socket.create_connection((host, port), timeout=timeout)
         self.s.settimeout(timeout)
         self.buf = b""
+        # ヘッドの JSON テレメトリ (20 Hz) を止めてから使う。
+        # GUI 側で再開したいときは "START" を送る。
+        self.s.sendall(b"STOP\n")
+        time.sleep(0.3)
+        try:
+            self.s.recv(65536)
+        except socket.timeout:
+            pass
 
     def send(self, cmd):
         self.s.sendall((cmd + "\n").encode())
@@ -61,6 +69,20 @@ class Head:
 # ---------------------------------------------------------------- 同期
 def do_sync(h, n_points=300, verbose=True):
     """同期フェーズを走らせ、全ノードの ready 状態を返す"""
+    # ノード電源がヘッド制御なら投入して起動を待つ
+    h.send("power 1")
+    boot_ms = 0
+    for ln in h.lines(1.5):
+        if ln.startswith("OK,power"):
+            p = ln.split(",")
+            if p[2] != "disabled":
+                boot_ms = int(p[3])
+            break
+    if boot_ms:
+        if verbose:
+            print(f"  ノード電源 ON、起動待ち {boot_ms/1000:.1f} 秒...", flush=True)
+        time.sleep(boot_ms / 1000.0)
+
     h.send(f"sync {n_points}")
     wait = n_points / 10.0 + 3.0
     if verbose:
@@ -310,7 +332,7 @@ def swim(h, freq=2.0, amp=20.0, dphi=36.0, seconds=10,
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("test", choices=["mac", "sync", "rf0", "sync1", "drift1",
+    ap.add_argument("test", choices=["ping", "mac", "sync", "rf0", "sync1", "drift1",
                                      "hall1", "hall2", "joint1", "swim"])
     ap.add_argument("--node", type=int, default=1)
     ap.add_argument("--reps", type=int, default=20)
@@ -325,7 +347,35 @@ def main():
 
     h = Head(a.host)
     try:
-        if a.test == "mac":
+        if a.test == "ping":
+            # まずヘッドのファームが新しいか確認する
+            h.send("ver")
+            ver = None
+            for ln in h.lines(2.0):
+                print(" ", ln)
+                if ln.startswith("OK,ver"):
+                    ver = ln
+            if ver is None:
+                print("\n  ★ ヘッドが 'ver' に応答しません。古いファームが載っています。")
+                print("     PROJECT TASKS → head → Upload で書き直してください。")
+                print("     （矢印ボタンは default_envs=node なので node しか書きません）")
+                return
+            print("\nブロードキャストを1発送ります。")
+            h.send("power 1")
+            list(h.lines(3.0))
+            h.send("ping")
+            got = False
+            for ln in h.lines(4.0):
+                print(" ", ln)
+                if ln.startswith("HELLO") or ln.startswith("MAC"):
+                    got = True
+            if not got:
+                print("\n  ノードからの応答なし。確認事項:")
+                print("   1) ノードのファームも書き直したか")
+                print("      → HELLO への応答は今回追加した機能です")
+                print("   2) ノードに電源が来ているか（USB給電で試す）")
+                print("   3) ヘッドとノードの UNAGI_CHANNEL が一致しているか")
+        elif a.test == "mac":
             h.send("mac")
             for ln in h.lines(3.0):
                 print(" ", ln)

@@ -11,7 +11,7 @@ push_cal.py — hall_calib.py が出した較正係数を ESP-NOW 経由でノ�
 """
 import argparse, socket, time, sys
 
-HOST, PORT = "192.168.4.1", 5000
+HOST, PORT = "192.168.4.1", 5555
 
 
 def connect(host=HOST):

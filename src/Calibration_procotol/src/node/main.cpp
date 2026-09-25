@@ -22,7 +22,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Preferences.h>
-#include "unagi_protocol.h"
+#include "unagi_protocol.h"   // include/ に置いてあります
 
 // ---------------- 設定 ----------------
 #define FW_HASH        0x00010004
@@ -253,7 +253,14 @@ void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
     p.channel = UNAGI_CHANNEL; p.encrypt = false;
     esp_now_add_peer(&p);
   }
-  if (NODE_ID == 0) return;                        // ID 未設定なら無視
+  // HELLO への応答は ID 未設定でも返す（存在確認に使うため）
+  if (h->type == MSG_HELLO) {
+    MsgHello r = {}; r.h = {MSG_HELLO, NODE_ID, 0};
+    WiFi.macAddress(r.mac); r.fw_hash = FW_HASH;
+    send_head(&r, sizeof(r));
+    return;
+  }
+  if (NODE_ID == 0) return;                        // ID 未設定なら以降は無視
 
   switch (h->type) {
     case MSG_SYNC_BEGIN: {
