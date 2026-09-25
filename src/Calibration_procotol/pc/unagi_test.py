@@ -33,6 +33,13 @@ class Head:
             self.s.recv(65536)
         except socket.timeout:
             pass
+        # 切断のたびにノード電源が落ちて10台が再起動するのを防ぐ
+        self.s.sendall(b"keepload 1\n")
+        time.sleep(0.2)
+        try:
+            self.s.recv(65536)
+        except socket.timeout:
+            pass
 
     def send(self, cmd):
         self.s.sendall((cmd + "\n").encode())
@@ -360,16 +367,41 @@ def main():
                 print("     PROJECT TASKS → head → Upload で書き直してください。")
                 print("     （矢印ボタンは default_envs=node なので node しか書きません）")
                 return
-            print("\nブロードキャストを1発送ります。")
+            print("\nノード電源を入れます。")
             h.send("power 1")
             list(h.lines(3.0))
+            h.send("ver")
+            vbus = None
+            for ln in h.lines(2.0):
+                print(" ", ln)
+                if ln.startswith("OK,ver"):
+                    for f in ln.split(","):
+                        if f.startswith("vbus="):
+                            vbus = float(f[5:])
+                        if f.startswith("load="):
+                            load = f[5:]
+            if vbus is not None and vbus < 1.0:
+                print(f"\n  ★ スイッチを閉じても VBUS = {vbus:.2f} V です。")
+                print("     ノードには給電されていません。ESP-NOW 以前の問題です。")
+                print("     確認: 2S バッテリ/電源が IN+ に繋がっているか、")
+                print("           AON6407 が導通しているか、負荷側の配線")
+                print("     ESP-NOW だけ切り分けたいなら、ノード1枚を USB 給電にして")
+                print("     もう一度 ping を実行してください。")
             h.send("ping")
             got = False
+            send_err = None
             for ln in h.lines(4.0):
                 print(" ", ln)
+                if ln.startswith("OK,ping"):
+                    p = ln.split(",")
+                    if len(p) > 2 and p[2] != "0":
+                        send_err = p[3] if len(p) > 3 else p[2]
                 if ln.startswith("HELLO") or ln.startswith("MAC"):
                     got = True
-            if not got:
+            if send_err:
+                print(f"\n  ★ ヘッドの esp_now_send が失敗しています: {send_err}")
+                print("     ノード以前にヘッド側の問題です。ヘッドを書き直してください。")
+            elif not got:
                 print("\n  ノードからの応答なし。確認事項:")
                 print("   1) ノードのファームも書き直したか")
                 print("      → HELLO への応答は今回追加した機能です")
