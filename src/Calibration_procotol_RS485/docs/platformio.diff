@@ -1,0 +1,15 @@
+--- /tmp/claude-0/-home-claude/757161a1-a8e8-5e6c-822b-4d14f53c1978/scratchpad/rs485/Calibration_procotol_RS485_v3/platformio.ini	2026-10-14 15:38:55.000000000 +0200
++++ platformio.ini	2026-10-14 16:44:20.749964035 +0200
+@@ -38,3 +38,12 @@
+ 
+ [env:head]
+ build_src_filter = +<head/>
++
++; ---- 校正用: ノードが WiFi AP "UNAGI-NODE-<id>" になり hall_calib_gui.py と直接話す ----
++;   書き込み: PROJECT TASKS → node_calwifi ▸ Upload。校正が終わったら必ず node ▸ Upload で本番に戻す。
++;   本番の env:node には WiFi のコードは一切入らない（#ifdef UNAGI_CAL_WIFI）。
++[env:node_calwifi]
++build_src_filter = +<node/>
++build_flags =
++    ${env.build_flags}
++    -DUNAGI_CAL_WIFI=1

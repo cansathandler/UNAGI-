@@ -1,0 +1,412 @@
+--- Calibration_procotol_RS485_v3/src/head/main.cpp	2026-10-14 15:38:55.000000000 +0200
++++ work/src/head/main.cpp	2026-10-16 09:33:38.723786126 +0200
+@@ -26,6 +26,16 @@
+ //   4. go の後、各ノードの走行時間が過ぎたらヘッドが REPORT を取りに行く。
+ //   5. MAC を事前に知らなくても ID 1..10 に送れる（ESP-NOW のペア登録が不要）。
+ //   PC 側 (pc/unagi.py) に返す行の書式は v2 と同じ。
++//
++//  v3.1: 校正ブリッジ（TCP 5000）
++//   ・WiFi UNAGI-HEAD の 192.168.4.1:5000 に hall_calib_gui.py / hall_live.py をつなぐと、
++//     node_calwifi と同じテキストプロトコルで、指定したノード1台を RS-485 越しに使える。
++//     行はそのままノードへ（CALX_REQ）、ノードの返事と 1 kHz の Hall データはそのまま PC へ。
++//   ・Hall の各サンプルに INA226 の電圧・電流（ヘッド時刻で補間）を付ける:
++//       time_us,S1_raw,S2_raw,cmd_milli,bus_mV,cur_mA
++//     time_us はヘッド時刻（ノードがビーコン同期で換算）。電流は「ノード給電全体」の値。
++//   ・ブリッジ専用コマンド: NODE <id> / HEAD POWER 0|1 / HEAD INFO
++//   ・ブリッジ接続中は INA226 を高速設定（平均 1 回・変換 1.1 ms → 約 2.2 ms ごとに更新）。
+ // =====================================================================
+ 
+ #include <Arduino.h>
+@@ -38,7 +48,7 @@
+ #include "unagi_protocol.h"
+ #include "unagi_bus.h"
+ 
+-#define HEAD_FW            "head-v2-rs485-3.0.1"
++#define HEAD_FW            "head-v2-rs485-3.1.0"
+ 
+ // ------------------------- build options -----------------------------
+ #define GATE_ACTIVE_HIGH   1
+@@ -48,6 +58,8 @@
+ #define NET_SSID           "UNAGI-HEAD"
+ #define NET_PASS           "unagi12345"
+ #define TCP_PORT           5555
++#define BRIDGE_PORT        5000
++#define INA_FAST_DELAY_US  1650     // 高速設定で、読んだ値の測定時刻の遅れ（変換時間の中央）
+ 
+ #define DROP_LINK_CUTS_LOAD 1
+ #define DEFAULT_TRIP_A     28.0f
+@@ -76,10 +88,13 @@
+ static const uint16_t AVG_CODE[8] = {1, 4, 16, 64, 128, 256, 512, 1024};
+ static uint16_t cfgAvgIndex = 2;
+ static uint16_t buildConfig(uint16_t i) { return 0x4000 | ((i & 7) << 9) | (0x4 << 6) | (0x4 << 3) | 0x7; }
++static bool ina_fast = false;            // 校正ブリッジ接続中: 平均 1 回（約 2.2 ms ごとに新しい値）
+ 
+ // ---------------------------- state ----------------------------------
+ WiFiServer  server(TCP_PORT);
+ WiFiClient  client;
++WiFiServer  bserver(BRIDGE_PORT);       // 校正ブリッジ
++WiFiClient  bcli;
+ Preferences prefs;
+ 
+ bool     streaming = true;
+@@ -240,7 +255,7 @@
+ static volatile bool     beacon_due = false;    // ビーコンを出す時刻を過ぎた
+ static uint32_t          n_timeouts = 0;
+ 
+-enum : uint8_t { K_PLAIN = 0, K_DISCOVER, K_ARM, K_START, K_DUMP, K_REPORT };
++enum : uint8_t { K_PLAIN = 0, K_DISCOVER, K_ARM, K_START, K_DUMP, K_REPORT, K_CALX };
+ 
+ struct Req {
+   uint8_t  kind, id, expect, tries;   // expect = 待つ返事の type（0 = 返事なし）
+@@ -411,6 +426,261 @@
+   }
+ }
+ 
++// ===================== 校正ブリッジ (TCP 5000) =====================
++// PC の1行 → CALX_REQ（1行ずつ、seq つき）→ ノードの cal_cmd()。ノードの返事 (CALX_DATA) の
++// テキストはそのまま、サンプルには INA226 の V/I を付けて PC へ。
++static uint8_t  br_node = 0;              // 転送先ノード（NVS "calnode"）
++static bool     br_active = false;        // PC がつながっている
++static bool     br_closing = false;       // 切断後、STOP / HALL 0 を送り終えるまで
++static bool     br_open = false;          // 次の要求に CALX_F_OPEN を付ける
++static uint8_t  br_seq = 0, br_last_rx_seq = 0;
++static bool     br_have_rx = false;
++static bool     br_node_stream = false, br_node_more = false, br_synced_warned = false;
++static uint32_t br_last_poll_ms = 0, br_fail_ms = 0;
++static uint32_t br_samples = 0;
++#define BR_CMDQ 16
++static char     br_cmd[BR_CMDQ][CALX_TEXT_MAX + 1];
++static uint8_t  br_cmd_head = 0, br_cmd_n = 0;
++static char     br_out[8192];
++static size_t   br_out_n = 0;
++static uint32_t br_flush_ms = 0;
++
++static void br_flush() {
++  if (br_out_n && bcli && bcli.connected()) bcli.write((const uint8_t*)br_out, br_out_n);
++  br_out_n = 0;
++  br_flush_ms = millis();
++}
++static void br_write(const char* s, size_t n) {
++  if (!br_active) return;
++  if (br_out_n + n > sizeof(br_out)) br_flush();
++  if (n > sizeof(br_out)) return;
++  memcpy(br_out + br_out_n, s, n);
++  br_out_n += n;
++}
++static void br_printf(const char* fmt, ...) {
++  char b[256];
++  va_list ap; va_start(ap, fmt);
++  int n = vsnprintf(b, sizeof(b) - 1, fmt, ap);
++  va_end(ap);
++  if (n < 0) return;
++  if (n > (int)sizeof(b) - 2) n = sizeof(b) - 2;
++  b[n++] = '\n';
++  br_write(b, n);
++}
++static void br_push_cmd(const char* t) {
++  if (br_cmd_n >= BR_CMDQ) { br_printf("ERR head: bridge command queue full, dropped '%s'", t); return; }
++  char* d = br_cmd[(br_cmd_head + br_cmd_n) % BR_CMDQ];
++  strncpy(d, t, CALX_TEXT_MAX); d[CALX_TEXT_MAX] = 0;
++  br_cmd_n++;
++}
++
++// ---- INA226 の V/I をヘッド時刻つきで保存（ブリッジ接続中は 2 ms ごとに読む）----
++struct ViPt { uint32_t t; float v, i; };
++#define VI_N 1024
++static ViPt     vi_ring[VI_N];
++static uint16_t vi_head = 0, vi_cnt = 0;
++static void vi_push(uint32_t t, float v, float i) {
++  vi_ring[vi_head] = {t, v, i};
++  vi_head = (vi_head + 1) % VI_N;
++  if (vi_cnt < VI_N) vi_cnt++;
++}
++// 時刻 t（ヘッド時刻 µs, 32 bit）の V/I を直線補間。範囲外は端の値。
++static bool vi_at(uint32_t t, float& v, float& i) {
++  if (!vi_cnt) return false;
++  int k = (vi_head + VI_N - 1) % VI_N;                 // 最新
++  if ((int32_t)(t - vi_ring[k].t) >= 0) { v = vi_ring[k].v; i = vi_ring[k].i; return true; }
++  for (uint16_t n = 1; n < vi_cnt; n++) {
++    int j = (k + VI_N - 1) % VI_N;                     // ひとつ前
++    if ((int32_t)(t - vi_ring[j].t) >= 0) {
++      const ViPt& a = vi_ring[j]; const ViPt& b = vi_ring[k];
++      float span = (float)(int32_t)(b.t - a.t), f = span > 0 ? (float)(int32_t)(t - a.t) / span : 0.0f;
++      v = a.v + f * (b.v - a.v); i = a.i + f * (b.i - a.i);
++      return true;
++    }
++    k = j;
++  }
++  v = vi_ring[k].v; i = vi_ring[k].i;                  // 最古より前
++  return true;
++}
++static void ina_set_fast(bool on) {
++  ina_fast = on;
++  ina_write(REG_CONFIG, on ? (uint16_t)(0x4000 | (0x4 << 6) | (0x4 << 3) | 0x7) : buildConfig(cfgAvgIndex));
++  vi_cnt = 0; vi_head = 0;
++}
++static void fast_sample() {                            // 電流と電圧だけ読む（約 0.3 ms）
++  uint16_t raw;
++  const uint32_t t = (uint32_t)esp_timer_get_time() - INA_FAST_DELAY_US;
++  bool ok = true;
++  if (ina_read(REG_CURRENT, raw)) { curRawA = (int16_t)raw * I_LSB_AMPS; curA = curRawA * calGain - calOffset; } else ok = false;
++  if (ina_read(REG_BUS, raw))     busV = raw * BUS_LSB_V; else ok = false;
++  powW = busV * curA;
++  uint32_t now = millis();
++  if (lastIntegrate) {
++    double dt_h = (now - lastIntegrate) / 3600000.0;
++    charge_mAh += curA * 1000.0 * dt_h;
++    energy_Wh  += powW * dt_h;
++  }
++  lastIntegrate = now;
++  if (ok) vi_push(t, busV, curA);
++}
++
++// ---- 要求づくり（スケジューラから。キュー・ダンプ・REPORT がないとき）----
++static bool calx_make(Req& r) {
++  if (!valid_id(br_node) || !(br_active || br_closing)) return false;
++  const uint32_t now = millis();
++  const bool have_cmd = br_cmd_n > 0;
++  if (!have_cmd && !br_open) {
++    if (br_closing) { br_closing = false; return false; }          // STOP / HALL 0 を送り終えた
++    uint32_t gap = br_node_more ? 0 : (br_node_stream ? 10 : 50);
++    if (now - br_last_poll_ms < gap) return false;
++    if (now - br_fail_ms < 300) return false;                      // 応答がないノードを叩き続けない
++  }
++  MsgCalxReq q; memset(&q, 0, sizeof(q));
++  hdr_init(q.h, UNAGI_MAGIC_HEAD, M_CALX_REQ, br_node, trial);
++  q.seq = ++br_seq;
++  q.flags = br_open ? CALX_F_OPEN : 0;
++  if (have_cmd) {
++    const char* t = br_cmd[br_cmd_head];
++    q.n = (uint8_t)strnlen(t, CALX_TEXT_MAX);
++    memcpy(q.text, t, q.n);
++    br_cmd_head = (br_cmd_head + 1) % BR_CMDQ; br_cmd_n--;
++  }
++  br_open = false;
++  r.kind = K_CALX; r.id = br_node; r.expect = M_CALX_DATA; r.timeout_ms = 20; r.tries = 3; r.aux = 0;
++  strcpy(r.name, "calx");
++  r.len = (uint8_t)(offsetof(MsgCalxReq, text) + q.n);
++  memcpy(r.buf, &q, r.len);
++  br_last_poll_ms = now;
++  return true;
++}
++static void calx_on_fail(const Req& r) {
++  MsgCalxReq q; memset(&q, 0, sizeof(q)); memcpy(&q, r.buf, r.len);
++  if (q.n) { q.text[q.n < CALX_TEXT_MAX ? q.n : CALX_TEXT_MAX - 1] = 0; br_printf("ERR head: node %u did not answer, command '%s' may be lost", r.id, q.text); }
++  else if (millis() - br_fail_ms > 2000) br_printf("ERR head: node %u does not answer on RS-485 (power? id? cable?)", r.id);
++  if (q.flags & CALX_F_OPEN) br_open = true;                       // 開始はやり直す
++  br_fail_ms = millis();
++  br_node_more = false;
++}
++static void calx_on_data(const BusRx& it) {
++  if (it.len < CALX_HDR_LEN) return;
++  MsgCalxData d; memcpy(&d, it.data, CALX_HDR_LEN);
++  if (d.h.node_id != br_node) return;
++  if (br_have_rx && d.seq == br_last_rx_seq) return;               // 遅れて届いた同じ返事
++  br_have_rx = true; br_last_rx_seq = d.seq;
++  br_node_stream = d.flags & CALX_F_STREAM;
++  br_node_more   = d.flags & CALX_F_MORE;
++  const int ns = d.n_s, nt = d.n_txt;
++  if (CALX_HDR_LEN + ns * (int)sizeof(CalxSample) + nt > it.len) return;
++  const uint8_t* p = it.data + CALX_HDR_LEN;
++  // 1) テキスト（行ごと。Hall の見出し行には V/I の列を足す）
++  const char* tx = (const char*)(p + ns * sizeof(CalxSample));
++  int a = 0;
++  for (int k = 0; k < nt; k++) {
++    if (tx[k] != '\n') continue;
++    if (k - a >= 8 && !strncmp(tx + a, "time_us,", 8)) br_printf("time_us,S1_raw,S2_raw,cmd_milli,bus_mV,cur_mA");
++    else { br_write(tx + a, k - a); br_write("\n", 1); }
++    a = k + 1;
++  }
++  if (a < nt) { br_write(tx + a, nt - a); br_write("\n", 1); }
++  // 2) サンプル + V/I
++  if (ns && !(d.flags & CALX_F_SYNCED) && !br_synced_warned) {
++    br_synced_warned = true;
++    br_printf("INFO head: node %u is not time-synced yet - V/I matched by arrival time (about +-20 ms)", br_node);
++  }
++  char line[64];
++  for (int k = 0; k < ns; k++) {
++    CalxSample s; memcpy(&s, p + k * sizeof(CalxSample), sizeof(s));
++    float v = busV, i = curA;
++    if (d.flags & CALX_F_SYNCED) vi_at(s.t_us, v, i);
++    int n = snprintf(line, sizeof(line), "%lu,%d,%d,%d,%ld,%ld\n", (unsigned long)s.t_us, s.v1, s.v2, s.u_milli,
++                     lroundf(v * 1000.0f), lroundf(i * 1000.0f));
++    br_write(line, n);
++  }
++  br_samples += ns;
++}
++
++static void br_handle_line(char* line) {
++  char tmp[CALX_TEXT_MAX + 1];
++  strncpy(tmp, line, CALX_TEXT_MAX); tmp[CALX_TEXT_MAX] = 0;
++  char* verb = strtok(tmp, " \t");
++  if (!verb) return;
++  for (char* p = verb; *p; ++p) *p = toupper(*p);
++  if (!strcmp(verb, "NODE")) {
++    char* a = strtok(nullptr, " \t");
++    if (a) {
++      int id = atoi(a);
++      if (!valid_id(id)) { br_printf("ERR NODE must be 1..%d", UNAGI_N_NODES); return; }
++      if (id != br_node) {
++        if (valid_id(br_node)) { br_push_cmd("STOP"); br_push_cmd("HALL 0"); }   // 前のノードを止める
++        br_node = (uint8_t)id; br_open = true; br_have_rx = false; br_synced_warned = false;
++        prefs.begin("unagi", false); prefs.putUChar("calnode", br_node); prefs.end();
++      }
++    }
++    br_printf("OK NODE %u", br_node);
++    return;
++  }
++  if (!strcmp(verb, "HEAD")) {
++    char* a = strtok(nullptr, " \t");
++    for (char* p = a; p && *p; ++p) *p = toupper(*p);
++    if (a && !strcmp(a, "POWER")) {
++      char* b = strtok(nullptr, " \t");
++      bool on = b && atoi(b);
++      if (on && !sensorOk)   { br_printf("ERR HEAD POWER: INA226 not found (use 'power 1 force' on port 5555)"); return; }
++      if (on && alertLatched) { br_printf("ERR HEAD POWER: overcurrent latched (send CLEAR on port 5555)"); return; }
++      if (!on) bcast_stop(2);
++      setLoad(on);
++      br_printf("OK HEAD POWER %d", loadOn ? 1 : 0);
++      return;
++    }
++    br_printf("HEAD fw=%s load=%d sensor=%d v=%.3f i=%.4f node=%u nodes=%d fast=%d samples=%lu", HEAD_FW, loadOn ? 1 : 0,
++              sensorOk ? 1 : 0, busV, curA, br_node, nodesKnown(), ina_fast ? 1 : 0, (unsigned long)br_samples);
++    return;
++  }
++  if (!valid_id(br_node)) { br_printf("ERR head: no node selected - send NODE <id>"); return; }
++  br_push_cmd(line);
++}
++
++static void br_on_connect() {
++  br_active = true; br_closing = false; br_open = true;
++  br_cmd_n = 0; br_out_n = 0; br_have_rx = false; br_synced_warned = false;
++  br_node_stream = br_node_more = false; br_fail_ms = 0;
++  ina_set_fast(true);
++  br_printf("READY unagi_head_bridge fw=%s node=%u load=%d", HEAD_FW, br_node, loadOn ? 1 : 0);
++  if (!loadOn) br_printf("INFO head: node power is OFF - send HEAD POWER 1");
++  if (!valid_id(br_node)) {
++    for (int i = 1; i <= UNAGI_N_NODES && !valid_id(br_node); i++) if (node_known[i]) br_node = i;
++    if (!valid_id(br_node)) br_printf("INFO head: no node selected - send NODE <id>");
++  }
++}
++static void br_on_disconnect() {
++  br_active = false;
++  br_cmd_n = 0;
++  if (valid_id(br_node)) { br_closing = true; br_push_cmd("STOP"); br_push_cmd("HALL 0"); }
++  br_node_stream = br_node_more = false;
++  ina_set_fast(false);
++}
++static void br_poll() {
++  static char buf[CALX_TEXT_MAX + 1]; static uint16_t n = 0;
++#if ESP_ARDUINO_VERSION_MAJOR >= 3
++  WiFiClient inc = bserver.accept();
++#else
++  WiFiClient inc = bserver.available();
++#endif
++  if (inc) {
++    if (bcli) { bcli.stop(); br_on_disconnect(); }
++    bcli = inc; bcli.setNoDelay(true); n = 0;
++    br_on_connect();
++  }
++  if (bcli && !bcli.connected()) { bcli.stop(); br_on_disconnect(); }
++  while (bcli && bcli.connected() && bcli.available()) {
++    char c = bcli.read();
++    if (c == '\r') continue;
++    if (c == '\n') { buf[n] = 0; if (n) br_handle_line(buf); n = 0; }
++    else if (n < sizeof(buf) - 1) buf[n++] = c;
++  }
++  if (br_out_n && (millis() - br_flush_ms >= 20 || br_out_n > 6000)) br_flush();
++}
++
+ // ---- スケジューラ（loop から呼ぶ）----
+ static void on_fail(const Req& r) {
+   switch (r.kind) {
+@@ -418,6 +688,7 @@
+     case K_ARM:      if (node_known[r.id]) emitf("WARN,no_ready,%u,%u", r.id, trial); break;
+     case K_DUMP:     dump_on_fail(); break;
+     case K_REPORT:   report_on_fail(r.id); break;
++    case K_CALX:     calx_on_fail(r); break;
+     default:         emitf("ERR,timeout,%s,%u", r.name, r.id); break;
+   }
+ }
+@@ -425,7 +696,7 @@
+ static void sched_pick() {
+   if (rq_count) {
+     cur = rq[rq_head]; rq_head = (rq_head + 1) % RQ_N; rq_count--;
+-  } else if (!dump_make(cur) && !report_make(cur)) {
++  } else if (!dump_make(cur) && !report_make(cur) && !calx_make(cur)) {
+     return;
+   }
+   cur_try = 0; cur_state = 1;
+@@ -500,6 +771,10 @@
+       emitf("HELLO,%u,%s,%08lX,%u,%u,%g,%g,%g,%g,%.3f", id, mb, (unsigned long)m.fw, m.proto,
+             m.state, m.c[0], m.c[1], m.c[2], m.c[3], m.min_duty);
+       if (m.proto != UNAGI_PROTO_VER) emitf("WARN,proto_mismatch,%u,%u,%u", id, m.proto, UNAGI_PROTO_VER);
++      if (br_active && !valid_id(br_node) && valid_id(id)) {
++        br_node = id; br_open = true;
++        br_printf("INFO head: bridge -> node %u (found by discover)", id);
++      }
+       break;
+     }
+     case M_PARAM_ACK: {
+@@ -533,6 +808,10 @@
+       emitf("CALACK,%u,%.9g,%.9g,%.9g,%.9g,%.4f", id, m.c[0], m.c[1], m.c[2], m.c[3], m.min_duty);
+       break;
+     }
++    case M_CALX_DATA: {
++      calx_on_data(it);
++      break;
++    }
+     case M_PEEK: {
+       MsgPeek m; take(&m, sizeof(m), it);
+       emitf("PEEK,%u,%u,%u,%.2f,%.2f,%.3f,%.3f,%.3f,%.1f,%.3f,%u", id, m.state, m.n,
+@@ -791,6 +1070,8 @@
+   uint16_t manuf = 0, die = 0;
+   sensorOk = ina_read(REG_MANUF, manuf) && ina_read(REG_DIEID, die) && manuf == MANUF_TI && die == DIE_INA226;
+   calLoad();
++  prefs.begin("unagi", true); br_node = prefs.getUChar("calnode", 0); prefs.end();
++  if (!valid_id(br_node)) br_node = 0;
+   setTrip(tripAmps);
+   clearAlert();
+   attachInterrupt(digitalPinToInterrupt(PIN_ALERT), onAlert, FALLING);
+@@ -808,11 +1089,15 @@
+ 
+   server.begin();
+   server.setNoDelay(true);
++  bserver.begin();
++  bserver.setNoDelay(true);
+   streamGapMs = 1000 / streamHz;
+ 
+   delay(300);
+   Serial.printf("UNAGI head %s  AP \"%s\" %s:%d  RS-485 %lu bps  INA226=%s\n", HEAD_FW, NET_SSID,
+                 WiFi.softAPIP().toString().c_str(), TCP_PORT, (unsigned long)BUS_BAUD, sensorOk ? "OK" : "NOT FOUND");
++  Serial.printf("calibration bridge: %s:%d -> node %u (NODE <id> to change)\n",
++                WiFi.softAPIP().toString().c_str(), BRIDGE_PORT, br_node);
+   if (!sensorOk)
+     Serial.printf("INA226 NOT FOUND - manuf 0x%04X die 0x%04X  → 'power 1 force' でノード給電は可能\n", manuf, die);
+ }
+@@ -843,6 +1128,7 @@
+   }
+   if (client && client.connected()) pollLines(client, nbuf, nn, sizeof(nbuf));
+   pollLines(Serial, sbuf, sn, sizeof(sbuf));
++  br_poll();
+ 
+   // --- RS-485 ---
+   for (int k = 0; k < 16 && bus::recv(it, 0); k++) handle_rx(it);
+@@ -853,11 +1139,16 @@
+     alertFlag = false; alertLatched = true;
+     bcast_stop(1); setLoad(false);
+     emit("{\"evt\":\"OVERCURRENT\"}");
++    br_printf("EVT head OVERCURRENT -> node power OFF");
+   }
+ 
+   // --- INA226 ---
+   uint32_t now = millis();
+-  if (now - lastSample >= 5) { lastSample = now; sample(); }
++  if (ina_fast) {
++    static uint32_t last_fast_us = 0;
++    uint32_t nu = micros();
++    if (nu - last_fast_us >= 2000) { last_fast_us = nu; fast_sample(); }   // INA226 は約 2.2 ms ごとに更新
++  } else if (now - lastSample >= 5) { lastSample = now; sample(); }
+   if (streaming && now - lastStream >= streamGapMs) { lastStream = now; sendTelemetry(); }
+ 
+   // 次のフレームが来たらすぐ起きる（最大 1 tick 待ち）

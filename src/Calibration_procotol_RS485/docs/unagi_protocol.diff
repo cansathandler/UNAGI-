@@ -1,0 +1,50 @@
+--- Calibration_procotol_RS485_v3/include/unagi_protocol.h	2026-10-14 15:38:55.000000000 +0200
++++ work/include/unagi_protocol.h	2026-10-16 09:18:05.700244518 +0200
+@@ -41,6 +41,7 @@
+   M_CAL_SET   = 0x17,   // 指名   : 較正係数 / minduty / ゼロ点 → CAL_ACK
+   M_PEEK_REQ  = 0x18,   // 指名   : ホール値を平均して返す（較正・配線確認）→ PEEK
+   M_REPORT_REQ= 0x19,   // 指名   : 走行が終わっていれば REPORT を返す（未完なら無言）
++  M_CALX_REQ  = 0x1A,   // 指名   : 校正トンネル。テキストコマンド1行 + データ取り → CALX_DATA
+ 
+   // node -> head
+   M_HELLO     = 0x40,
+@@ -50,6 +51,7 @@
+   M_DUMP_DATA = 0x44,
+   M_CAL_ACK   = 0x45,
+   M_PEEK      = 0x46,
++  M_CALX_DATA = 0x47,
+ };
+ 
+ // 走行モード
+@@ -166,11 +168,31 @@
+   uint16_t sync_n;
+ };
+ 
++// ---- 校正トンネル (CALX) ----
++//  ヘッドの校正ブリッジ (TCP 5000) が PC の1行を MsgCalxReq.text に入れて送り、ノードは
++//  node_calwifi と同じテキストプロトコルで処理する。返事 (MsgCalxData) は
++//  [ヘッダ][サンプル n_s 個][テキスト n_txt バイト（改行区切りの行）]。
++//  seq: 新しい seq = 前の返事は届いた。text があれば1回だけ実行し、新しい返事を作る。
++//       同じ seq（ヘッドの再送）= 前の返事をそのまま再送（コマンドを2回実行しない・データを失わない）。
++#define CALX_F_OPEN      0x01     // req: セッション開始（ノードは駆動とストリームを止めて初期化）
++#define CALX_F_SYNCED    0x01     // data: t_us はヘッド時刻（ビーコン同期済み）
++#define CALX_F_MORE      0x02     // data: まだ送るものがある（すぐ次を取りに来て）
++#define CALX_F_STREAM    0x04     // data: HALL 1 で流している
++#define CALX_F_RUN       0x08     // data: RUN で駆動中
++#define CALX_TEXT_MAX    200
++struct MsgCalxReq  { Hdr h; uint8_t seq; uint8_t flags; uint8_t n; char text[CALX_TEXT_MAX]; };
++struct CalxSample  { uint32_t t_us; int16_t v1, v2, u_milli; };          // 10 B
++struct MsgCalxData { Hdr h; uint8_t seq; uint8_t flags; uint8_t n_s; uint8_t n_txt; uint16_t dropped; };
++#define CALX_HDR_LEN   ((int)sizeof(MsgCalxData))                       // 12 B
++#define CALX_ROOM      (250 - CALX_HDR_LEN)                             // 238 B（サンプル + テキスト）
++
+ #pragma pack(pop)
+ 
+ #define UNAGI_MAX_PAYLOAD 250
+ static_assert(sizeof(MsgDumpData) <= UNAGI_MAX_PAYLOAD, "bus frame payload is limited to 250 bytes");
+ static_assert(sizeof(MsgParam)    <= UNAGI_MAX_PAYLOAD, "bus frame payload is limited to 250 bytes");
++static_assert(sizeof(MsgCalxReq)  <= UNAGI_MAX_PAYLOAD, "bus frame payload is limited to 250 bytes");
++static_assert(sizeof(CalxSample) == 10, "CalxSample must be packed");
+ 
+ static inline uint16_t crc16(const void* data, size_t n) {
+   const uint8_t* p = (const uint8_t*)data;
